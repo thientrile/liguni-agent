@@ -1,0 +1,3 @@
+# ai-team: artifacts & worktree không đưa vào git (có thể chứa log/secret)
+.ai/
+.ai-worktrees-*/

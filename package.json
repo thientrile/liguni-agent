@@ -1,0 +1,16 @@
+{
+  "name": "liguni-agent",
+  "version": "0.1.0",
+  "description": "ai-team — CLI orchestrator một-lead-nhiều-worker (Claude lead · Codex implementer · critic read-only)",
+  "type": "module",
+  "bin": {
+    "ai-team": "tools/ai-team.mjs"
+  },
+  "scripts": {
+    "team": "node tools/ai-team.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
