@@ -34,7 +34,7 @@ const childEnv = Object.fromEntries(
 // --- args ---------------------------------------------------------------
 // --review-file <path>: dùng phân tích của specialist (do lead Claude tạo) thay cho critic nội bộ.
 // --task-id <id>: id cố định để lead biết trước .ai/tasks/<id>/ (đọc status.json, diff).
-const opts = { noReview: false, inPlace: false, taskId: null, reviewFile: null };
+const opts = { noReview: false, inPlace: false, taskId: null, reviewFile: null, provider: null };
 const positional = [];
 const rawArgs = process.argv.slice(2);
 for (let i = 0; i < rawArgs.length; i++) {
@@ -45,13 +45,47 @@ for (let i = 0; i < rawArgs.length; i++) {
   else if (a.startsWith("--task-id=")) opts.taskId = a.slice(10);
   else if (a === "--review-file") opts.reviewFile = rawArgs[++i];
   else if (a.startsWith("--review-file=")) opts.reviewFile = a.slice(14);
+  else if (a === "--provider") opts.provider = rawArgs[++i];
+  else if (a.startsWith("--provider=")) opts.provider = a.slice(11);
   else if (a.startsWith("--")) { console.error(`Cờ lạ: ${a}`); process.exit(1); }
   else positional.push(a);
 }
+
+// lệnh con `review`: chạy review CHỈ-ĐỌC trên 1 provider (mặc định Codex/OpenAI) để trải
+// tải khỏi quota Claude. Lead gộp stdout vào review file. Không tạo worktree/lock/task dir.
+if (positional[0] === "review") {
+  const subTask = positional.slice(1).join(" ").trim();
+  if (!subTask) { console.error('Usage: node tools/ai-team.mjs review [--provider codex|gemini|claude] "<task>"'); process.exit(1); }
+  const provider = opts.provider || (probe("codex") ? "codex" : probe("gemini") ? "gemini" : "claude");
+  const prompt = `Bạn là software architect CHỈ ĐỌC. KHÔNG sửa file.
+
+Task:
+${subTask}
+
+Khảo sát repo hiện tại rồi trả về ngắn gọn:
+1. Kế hoạch triển khai (các bước nhỏ)
+2. Rủi ro kiến trúc / coupling
+3. Rủi ro bảo mật & concurrency
+4. Test case cần có
+5. File có khả năng thay đổi`;
+  let r;
+  if (provider === "codex") {
+    const a = ["exec", "-", "-s", "read-only"]; // read-only: không ghi được, an toàn cho review
+    if (git(["rev-parse", "--is-inside-work-tree"]).out !== "true") a.push("--skip-git-repo-check");
+    r = await run("codex", a, { timeoutMs: REVIEW_TIMEOUT_MS, input: prompt });
+  } else if (provider === "gemini") {
+    r = await run("gemini", [], { timeoutMs: REVIEW_TIMEOUT_MS, input: prompt });
+  } else {
+    r = await run("claude", ["-p"], { timeoutMs: REVIEW_TIMEOUT_MS, input: prompt });
+  }
+  process.exit(r.ok ? 0 : 1); // stdout đã stream ra sẵn
+}
+
 const task = positional.join(" ").trim();
 
 if (!task) {
   console.error('Usage: node tools/ai-team.mjs [--no-review] [--in-place] [--task-id <id>] [--review-file <path>] "<task>"');
+  console.error('       node tools/ai-team.mjs review [--provider codex|gemini|claude] "<task>"');
   process.exit(1);
 }
 

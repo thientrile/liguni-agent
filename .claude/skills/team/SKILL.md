@@ -40,9 +40,19 @@ Quy tắc bất biến:
 
 Luôn kèm **Code Reviewer** ở phase review đối kháng trừ khi đã có reviewer chuyên sâu hơn.
 
-## Phase 1 — Review (song song, read-only)
+## Phase 1 — Review (read-only) + cân bằng tải
 
-Dispatch các specialist đã chọn **cùng lúc** (nhiều Agent tool trong 1 message). Mỗi người nhận task + được yêu cầu trả về: kế hoạch triển khai, rủi ro trong lĩnh vực họ, test case, file có khả năng đổi. **Nhấn mạnh read-only, không sửa file.**
+Mọi specialist đều chạy trên **cùng một quota Claude với lead** → bung nhiều cùng lúc = đốt limit Claude nhanh. Vì vậy:
+
+- **Cap song song: tối đa 2 specialist Claude / lần** (2 Agent tool trong 1 message). Cần hơn thì làm theo đợt, không bung 4–5 cùng lúc.
+- **Trải tải sang provider khác:** nếu muốn thêm góc review mà không dồn thêm vào Claude, đẩy 1 review sang **Codex read-only (quota OpenAI)** thay vì spawn thêm specialist:
+  ```bash
+  node tools/ai-team.mjs review "$ARGUMENTS"            # mặc định Codex, read-only
+  # hoặc --provider gemini nếu có
+  ```
+  Gộp stdout của nó vào review file như một "reviewer" nữa. **Vẫn phải có ≥1 specialist Claude** (quy tắc bắt buộc) — Codex chỉ là reviewer bổ sung để cân tải.
+
+Mỗi reviewer nhận task + trả về: kế hoạch triển khai, rủi ro trong lĩnh vực họ, test case, file có khả năng đổi. **Nhấn mạnh read-only, không sửa file.**
 
 Gộp kết quả họ trả về thành 1 file:
 ```
@@ -64,7 +74,7 @@ Lấy diff:
 ```bash
 git -C <workspace.dir> --no-pager diff HEAD
 ```
-Dispatch specialist review (Code Reviewer + chuyên gia bảo mật nếu liên quan), đưa diff cho họ tìm bug/lỗ hổng THỰC. Đừng bịa lỗi.
+Dispatch specialist review (Code Reviewer + chuyên gia bảo mật nếu liên quan), đưa diff cho họ tìm bug/lỗ hổng THỰC. Đừng bịa lỗi. **Vẫn cap tối đa 2 specialist Claude song song**; muốn thêm góc thì đẩy sang `node tools/ai-team.mjs review ...` (Codex read-only) trên diff.
 
 ## Phase 4 — Test
 
