@@ -6,6 +6,12 @@
   "bin": {
     "ai-team": "tools/ai-team.mjs"
   },
+  "files": [
+    "tools/",
+    ".claude/",
+    "README.md"
+  ],
+  "preferGlobal": true,
   "scripts": {
     "team": "node tools/ai-team.mjs"
   },

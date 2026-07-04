@@ -16,6 +16,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { openSync, writeSync, unlinkSync, createWriteStream, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const IS_WIN = process.platform === "win32";
@@ -31,10 +32,61 @@ const childEnv = Object.fromEntries(
   Object.entries(process.env).filter(([k]) => ENV_ALLOW.includes(k)),
 );
 
+function isLoopback(u) {
+  try { return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(new URL(u).hostname); }
+  catch { return false; }
+}
+// env cho worker: MẶC ĐỊNH strip. Khi bật gateway (export ANTHROPIC_BASE_URL) → chỉ forward
+// biến gateway, CHỈ cho worker Claude, ép loopback. KHÔNG bao giờ forward key thật của lead.
+// (Codex qua gateway: cấu hình provider trong ~/.codex/config.toml — xem README, không xử ở đây.)
+function envFor(worker) {
+  const env = { ...childEnv };
+  const gw = process.env.ANTHROPIC_BASE_URL;
+  if (worker === "claude" && gw) {
+    if (!isLoopback(gw) && !opts.allowRemoteGateway) {
+      console.error(`❌ Gateway không phải localhost: ${gw}\n   Gateway thấy toàn bộ prompt + code. Thêm --allow-remote-gateway nếu cố ý.`);
+      process.exit(2);
+    }
+    env.ANTHROPIC_BASE_URL = gw;
+    if (process.env.ANTHROPIC_AUTH_TOKEN) env.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN;
+    env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+  }
+  return env;
+}
+
+function readVersion() {
+  try {
+    const p = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    return JSON.parse(readFileSync(p, "utf8")).version || "0.0.0";
+  } catch { return "0.0.0"; }
+}
+function printUsage() {
+  console.log(`ai-team — orchestrator một-lead-nhiều-worker
+
+Dùng:
+  ai-team "<task>"                        chạy full pipeline (review → Codex → báo cáo)
+  ai-team review [--provider P] "<task>"  review read-only 1 provider (codex|gemini|claude)
+  ai-team doctor                          kiểm môi trường (CLI, login, git, gateway)
+  ai-team help | version
+
+Cờ (run):
+  --no-review              bỏ critic
+  --in-place               sửa thẳng cwd, không worktree
+  --task-id <id>           id cố định cho .ai/tasks/<id>/
+  --review-file <path>     dùng phân tích specialist thay critic nội bộ
+  --provider <p>           provider cho lệnh review
+  --allow-remote-gateway   cho phép gateway không phải localhost (RỦI RO)
+
+Gateway (tùy chọn): export ANTHROPIC_BASE_URL (+ ANTHROPIC_AUTH_TOKEN) trỏ proxy local
+để critic Claude đi qua. Chạy 'ai-team doctor' verify endpoint trước.
+Exit: 0 ok · 2 sai cú pháp · 75 hết-limit (thử lại) · 124 timeout · 1 lỗi khác.`);
+}
+
 // --- args ---------------------------------------------------------------
 // --review-file <path>: dùng phân tích của specialist (do lead Claude tạo) thay cho critic nội bộ.
 // --task-id <id>: id cố định để lead biết trước .ai/tasks/<id>/ (đọc status.json, diff).
-const opts = { noReview: false, inPlace: false, taskId: null, reviewFile: null, provider: null };
+const opts = { noReview: false, inPlace: false, taskId: null, reviewFile: null, provider: null,
+  allowRemoteGateway: false, help: false, version: false };
 const positional = [];
 const rawArgs = process.argv.slice(2);
 for (let i = 0; i < rawArgs.length; i++) {
@@ -47,8 +99,42 @@ for (let i = 0; i < rawArgs.length; i++) {
   else if (a.startsWith("--review-file=")) opts.reviewFile = a.slice(14);
   else if (a === "--provider") opts.provider = rawArgs[++i];
   else if (a.startsWith("--provider=")) opts.provider = a.slice(11);
-  else if (a.startsWith("--")) { console.error(`Cờ lạ: ${a}`); process.exit(1); }
+  else if (a === "--allow-remote-gateway") opts.allowRemoteGateway = true;
+  else if (a === "--help" || a === "-h") opts.help = true;
+  else if (a === "--version" || a === "-V") opts.version = true;
+  else if (a.startsWith("--")) { console.error(`Cờ lạ: ${a}`); process.exit(2); }
   else positional.push(a);
+}
+
+// --- router: help / version / doctor ------------------------------------
+if (opts.help || positional[0] === "help") { printUsage(); process.exit(0); }
+if (opts.version || positional[0] === "version") { console.log(readVersion()); process.exit(0); }
+
+if (positional[0] === "doctor") {
+  const m = (b) => (b ? "✓" : "✗");
+  console.log(`ai-team doctor  (v${readVersion()})`);
+  console.log(`  node     ${process.version}`);
+  console.log(`  codex    ${m(probe("codex"))}   login ${m(loginOk("codex", ["login", "status"]))}`);
+  console.log(`  claude   ${m(probe("claude"))}`);
+  console.log(`  gemini   ${m(probe("gemini"))}   (tùy chọn)`);
+  console.log(`  git      ${m(probe("git"))}`);
+  const gw = process.env.ANTHROPIC_BASE_URL;
+  if (!gw) {
+    console.log(`  gateway  (tắt — export ANTHROPIC_BASE_URL để bật)`);
+  } else {
+    console.log(`  gateway  ${gw}  ${isLoopback(gw) ? "(localhost ✓)" : "⚠ KHÔNG localhost"}`);
+    const root = gw.replace(/\/+$/, "");
+    for (const [label, ep] of [["/v1/messages (Claude)", "/v1/messages"], ["/v1/responses (Codex)", "/v1/responses"]]) {
+      let s;
+      try {
+        const r = await fetch(root + ep, { method: "POST", body: "{}", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(3000) });
+        s = r.status === 404 ? "404 KHÔNG có" : `${r.status} có`;
+      } catch (e) { s = e.name === "TimeoutError" ? "timeout" : "unreachable (gateway tắt?)"; }
+      console.log(`    ${label}: ${s}`);
+    }
+    if (!process.env.ANTHROPIC_AUTH_TOKEN) console.log(`    ⚠ thiếu ANTHROPIC_AUTH_TOKEN`);
+  }
+  process.exit(0);
 }
 
 // lệnh con `review`: chạy review CHỈ-ĐỌC trên 1 provider (mặc định Codex/OpenAI) để trải
@@ -72,22 +158,18 @@ Khảo sát repo hiện tại rồi trả về ngắn gọn:
   if (provider === "codex") {
     const a = ["exec", "-", "-s", "read-only"]; // read-only: không ghi được, an toàn cho review
     if (git(["rev-parse", "--is-inside-work-tree"]).out !== "true") a.push("--skip-git-repo-check");
-    r = await run("codex", a, { timeoutMs: REVIEW_TIMEOUT_MS, input: prompt });
+    r = await run("codex", a, { timeoutMs: REVIEW_TIMEOUT_MS, input: prompt, env: envFor("codex") });
   } else if (provider === "gemini") {
-    r = await run("gemini", [], { timeoutMs: REVIEW_TIMEOUT_MS, input: prompt });
+    r = await run("gemini", [], { timeoutMs: REVIEW_TIMEOUT_MS, input: prompt, env: envFor("gemini") });
   } else {
-    r = await run("claude", ["-p"], { timeoutMs: REVIEW_TIMEOUT_MS, input: prompt });
+    r = await run("claude", ["-p"], { timeoutMs: REVIEW_TIMEOUT_MS, input: prompt, env: envFor("claude") });
   }
   process.exit(r.ok ? 0 : 1); // stdout đã stream ra sẵn
 }
 
 const task = positional.join(" ").trim();
 
-if (!task) {
-  console.error('Usage: node tools/ai-team.mjs [--no-review] [--in-place] [--task-id <id>] [--review-file <path>] "<task>"');
-  console.error('       node tools/ai-team.mjs review [--provider codex|gemini|claude] "<task>"');
-  process.exit(1);
-}
+if (!task) { printUsage(); process.exit(2); }
 
 // --- helpers ------------------------------------------------------------
 // probe: tool có tồn tại & chạy được không (thay `command -v`/`where` vốn hỏng trên POSIX/Win).
@@ -112,14 +194,14 @@ function killTree(child, sig) {
 
 // run: KHÔNG reject theo exit code — trả {ok,code,stdout,stderr}. Prompt đi qua STDIN
 // (input) để né giới hạn 8191 ký tự & quoting/injection của cmd.exe trên Windows.
-function run(command, args, { cwd = process.cwd(), timeoutMs = 0, logFile, input } = {}) {
+function run(command, args, { cwd = process.cwd(), timeoutMs = 0, logFile, input, env = childEnv } = {}) {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd,
       shell: IS_WIN, // cần để nạp shim .cmd trên Windows; payload đi qua stdin nên an toàn
       detached: !IS_WIN, // tạo process group để kill cả cây con khi timeout
       stdio: [input != null ? "pipe" : "ignore", "pipe", "pipe"],
-      env: childEnv,
+      env,
     });
 
     let stdout = "";
@@ -228,7 +310,7 @@ await saveStatus();
 let worktreeToClean = null; // { dir, branch, baseSha }
 // Chỉ dọn worktree khi RỖNG (Codex chưa kịp làm gì). Có việc dở → GIỮ để chạy tiếp,
 // tránh mất công khi lỗi tạm thời (hết limit, timeout). Thành công thì cũng giữ để người review.
-async function fail(msg) {
+async function fail(msg, code = 1) {
   console.error(`\n❌ ${msg}`);
   status.state = "failed";
   status.error = msg;
@@ -247,12 +329,14 @@ async function fail(msg) {
       git(["branch", "-D", branch]);
     }
   }
-  process.exit(1);
+  process.exit(code);
 }
 
 console.log(`\n▶ ai-team ${taskId}`);
 console.log(`  review  : ${externalReview ? "specialist (--review-file)" : (reviewer?.name ?? "skipped")}`);
-console.log(`  git     : ${gitRoot ? "repo" : "no repo"} → ${useWorktree ? "worktree" : "in-place"}\n`);
+console.log(`  git     : ${gitRoot ? "repo" : "no repo"} → ${useWorktree ? "worktree" : "in-place"}`);
+if (process.env.ANTHROPIC_BASE_URL) console.log(`  gateway : ${process.env.ANTHROPIC_BASE_URL} (critic Claude)`);
+console.log("");
 
 // --- 1. Review: phản biện kiến trúc (read-only) -------------------------
 let reviewText = "(bỏ qua — không có critic)";
@@ -333,6 +417,7 @@ const c = await run("codex", codexArgs, {
   timeoutMs: CODEX_TIMEOUT_MS,
   logFile: path.join(taskDir, "codex.log"),
   input: codexPrompt,
+  env: envFor("codex"),
 });
 await writeFile(path.join(taskDir, "codex-result.md"), c.stdout.trim() || c.stderr.trim());
 status.completed.push("implementation");
@@ -343,7 +428,8 @@ if (!c.ok) {
   status.error_kind = rate ? "rate_limit" : (c.code === 124 ? "timeout" : "error");
   await fail(rate
     ? `Codex hết limit/nghẽn (đã lưu việc dở). Chờ limit reset rồi chạy lại: node tools/ai-team.mjs --task-id ${taskId} --in-place "<task>". Log: ${path.join(taskDir, "codex.log")}`
-    : `Codex thất bại (code ${c.code}). Xem ${path.join(taskDir, "codex.log")}`);
+    : `Codex thất bại (code ${c.code}). Xem ${path.join(taskDir, "codex.log")}`,
+    rate ? 75 : (c.code === 124 ? 124 : 1));
 }
 
 // --- báo cáo ------------------------------------------------------------
