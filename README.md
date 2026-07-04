@@ -44,14 +44,22 @@ node tools/ai-team.mjs "xây retry + idempotency cho notification service"
 Cờ:
 - `--no-review` — bỏ critic
 - `--in-place` — sửa thẳng thư mục hiện tại, không tạo worktree
+- `--task-id <id>` — id cố định cho `.ai/tasks/<id>/` (lead dùng để đọc status/diff)
+- `--review-file <path>` — dùng phân tích của specialist thay critic nội bộ (lead bơm vào)
 
 Env (tùy chọn): `CODEX_MODEL`, `GEMINI_MODEL`, `CODEX_TIMEOUT_MS` (mặc định 20 phút), `REVIEW_TIMEOUT_MS` (5 phút).
 
 ## Luồng chạy
 
-1. **Critic** khảo sát repo, trả về kế hoạch + rủi ro + test case (read-only).
-2. **Codex** triển khai trong branch cô lập `ai/codex-<id>` (git worktree), viết/chạy test.
-3. Orchestrator in **diff + hướng dẫn merge**. Bạn review rồi merge **thủ công**.
+Khi gọi qua `/team`, lead **phân công cho specialist agent** theo domain (Backend Architect, Security Architect, Code Reviewer…) — xem `.claude/skills/team/SKILL.md`:
+
+1. **Phân công** — lead in bảng ai làm gì.
+2. **Review** — specialist khảo sát repo read-only, trả kế hoạch + rủi ro + test case → gộp vào `.ai/reviews/<id>.md`.
+3. **Codex** triển khai trong branch cô lập `ai/codex-<id>` (worktree) với guidance của specialist.
+4. **Review đối kháng** — Code Reviewer / chuyên gia bảo mật soi diff.
+5. Lead báo cáo + in **diff + hướng dẫn merge**. Bạn review rồi merge **thủ công**.
+
+Chạy tay `node tools/ai-team.mjs` (không qua `/team`) thì bước review dùng critic CLI (gemini/`claude -p`) thay vì specialist.
 
 Kết quả lưu ở `.ai/tasks/<task-id>/`:
 ```

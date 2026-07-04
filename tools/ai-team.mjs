@@ -15,7 +15,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
-import { openSync, writeSync, unlinkSync, createWriteStream } from "node:fs";
+import { openSync, writeSync, unlinkSync, createWriteStream, readFileSync } from "node:fs";
 import path from "node:path";
 
 const IS_WIN = process.platform === "win32";
@@ -32,12 +32,26 @@ const childEnv = Object.fromEntries(
 );
 
 // --- args ---------------------------------------------------------------
-const argv = process.argv.slice(2);
-const flags = new Set(argv.filter((a) => a.startsWith("--")));
-const task = argv.filter((a) => !a.startsWith("--")).join(" ").trim();
+// --review-file <path>: dùng phân tích của specialist (do lead Claude tạo) thay cho critic nội bộ.
+// --task-id <id>: id cố định để lead biết trước .ai/tasks/<id>/ (đọc status.json, diff).
+const opts = { noReview: false, inPlace: false, taskId: null, reviewFile: null };
+const positional = [];
+const rawArgs = process.argv.slice(2);
+for (let i = 0; i < rawArgs.length; i++) {
+  const a = rawArgs[i];
+  if (a === "--no-review") opts.noReview = true;
+  else if (a === "--in-place") opts.inPlace = true;
+  else if (a === "--task-id") opts.taskId = rawArgs[++i];
+  else if (a.startsWith("--task-id=")) opts.taskId = a.slice(10);
+  else if (a === "--review-file") opts.reviewFile = rawArgs[++i];
+  else if (a.startsWith("--review-file=")) opts.reviewFile = a.slice(14);
+  else if (a.startsWith("--")) { console.error(`Cờ lạ: ${a}`); process.exit(1); }
+  else positional.push(a);
+}
+const task = positional.join(" ").trim();
 
 if (!task) {
-  console.error('Usage: node tools/ai-team.mjs [--no-review] [--in-place] "<task>"');
+  console.error('Usage: node tools/ai-team.mjs [--no-review] [--in-place] [--task-id <id>] [--review-file <path>] "<task>"');
   process.exit(1);
 }
 
@@ -125,15 +139,19 @@ if (!loginOk("codex", ["login", "status"])) {
   process.exit(1);
 }
 
-// chọn critic: gemini > claude -p > none
+// review: --review-file (specialist) ưu tiên; else critic CLI gemini > claude -p > none
 let reviewer = null; // { name, cmd, args }
-if (!flags.has("--no-review")) {
+let externalReview = null;
+if (opts.reviewFile) {
+  try { externalReview = readFileSync(opts.reviewFile, "utf8"); }
+  catch (e) { console.error(`❌ Không đọc được --review-file ${opts.reviewFile}: ${e.message}`); process.exit(1); }
+} else if (!opts.noReview) {
   if (probe("gemini")) reviewer = { name: "gemini", cmd: "gemini", args: [] };
   else if (probe("claude")) reviewer = { name: "claude", cmd: "claude", args: ["-p"] };
 }
 
 const gitRoot = git(["rev-parse", "--is-inside-work-tree"]).out === "true";
-const useWorktree = gitRoot && !flags.has("--in-place");
+const useWorktree = gitRoot && !opts.inPlace;
 
 // --- process lock (atomic O_EXCL) ---------------------------------------
 await mkdir(".ai", { recursive: true });
@@ -153,7 +171,9 @@ try {
 process.on("exit", () => { if (ownLock) try { unlinkSync(lockFile); } catch {} });
 
 // --- task setup ---------------------------------------------------------
-const taskId = `task-${Date.now()}`;
+const taskId = opts.taskId
+  ? opts.taskId.replace(/[^A-Za-z0-9._-]/g, "-")
+  : `task-${Date.now()}`;
 const taskDir = path.resolve(".ai", "tasks", taskId);
 await mkdir(taskDir, { recursive: true });
 const statusFile = path.join(taskDir, "status.json");
@@ -162,7 +182,7 @@ const status = {
   id: taskId,
   state: "starting",
   task,
-  reviewer: reviewer?.name ?? "none",
+  reviewer: externalReview ? "specialist" : (reviewer?.name ?? "none"),
   workspace: { mode: useWorktree ? "worktree" : "in_place", dir: null, branch: null },
   completed: [],
   createdAt: new Date().toISOString(),
@@ -185,12 +205,17 @@ async function fail(msg) {
 }
 
 console.log(`\n▶ ai-team ${taskId}`);
-console.log(`  critic  : ${reviewer?.name ?? "skipped"}`);
+console.log(`  review  : ${externalReview ? "specialist (--review-file)" : (reviewer?.name ?? "skipped")}`);
 console.log(`  git     : ${gitRoot ? "repo" : "no repo"} → ${useWorktree ? "worktree" : "in-place"}\n`);
 
-// --- 1. Critic: phản biện kiến trúc (read-only) -------------------------
+// --- 1. Review: phản biện kiến trúc (read-only) -------------------------
 let reviewText = "(bỏ qua — không có critic)";
-if (reviewer) {
+if (externalReview) {
+  reviewText = externalReview.trim() || "(rỗng)";
+  await writeFile(path.join(taskDir, "review.md"), reviewText);
+  status.completed.push("review");
+  console.log("── [1/2] review: dùng phân tích specialist (--review-file) ──");
+} else if (reviewer) {
   console.log(`── [1/2] ${reviewer.name}: phản biện kiến trúc (read-only) ──`);
   status.state = "reviewing";
   await saveStatus();
