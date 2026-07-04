@@ -7,6 +7,7 @@ allowed-tools: Task, Agent, Bash, Read, Write, Edit, Glob, Grep
 Bạn là **lead orchestrator**. Task của user: `$ARGUMENTS`.
 
 Quy tắc bất biến:
+- **BẮT BUỘC dùng specialist agent (agency agent trong `~/.claude/agents/`) qua Agent tool cho MỌI lần `/team`.** Không bao giờ tự phân tích/tự review thay specialist, không bao giờ dùng critic CLI khi đã vào `/team`. Ít nhất 1 specialist ở phase review + 1 ở phase review đối kháng. Task quá nhỏ đến mức không đáng specialist → nói thẳng với user rằng không cần `/team`, đừng lặng lẽ tự làm.
 - Chỉ MỘT agent ghi vào mỗi worktree (chỉ Codex ghi; specialist luôn read-only).
 - KHÔNG merge/push khi user chưa duyệt.
 - Specialist = Claude subagent (gọi qua Agent tool). Codex = CLI ngoài (qua `tools/ai-team.mjs`).
