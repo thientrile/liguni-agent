@@ -49,6 +49,8 @@ Gộp kết quả họ trả về thành 1 file:
 Write .ai/reviews/<TASK_ID>.md  ← ghép "## <Tên agent>\n<phân tích>" của từng specialist
 ```
 
+**Khi specialist hết limit / trả null / lỗi:** dùng kết quả của những specialist CÒN sống, ghi rõ ai không phản hồi. Nếu TẤT CẢ đều chết vì limit → DỪNG, báo user "specialist agent đang hết limit, thử lại sau" — đừng tự phân tích thay (vi phạm quy tắc bắt buộc). Không tự ý fallback sang critic CLI.
+
 ## Phase 2 — Codex triển khai
 
 ```bash

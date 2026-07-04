@@ -191,15 +191,27 @@ const saveStatus = () => writeFile(statusFile, JSON.stringify(status, null, 2));
 await writeFile(path.join(taskDir, "request.md"), `# Task\n\n${task}\n`);
 await saveStatus();
 
-let worktreeToClean = null; // chỉ dọn khi FAIL; thành công thì giữ để người review
+let worktreeToClean = null; // { dir, branch, baseSha }
+// Chỉ dọn worktree khi RỖNG (Codex chưa kịp làm gì). Có việc dở → GIỮ để chạy tiếp,
+// tránh mất công khi lỗi tạm thời (hết limit, timeout). Thành công thì cũng giữ để người review.
 async function fail(msg) {
   console.error(`\n❌ ${msg}`);
   status.state = "failed";
   status.error = msg;
   await saveStatus().catch(() => {});
   if (worktreeToClean) {
-    git(["worktree", "remove", "--force", worktreeToClean.dir]);
-    git(["branch", "-D", worktreeToClean.branch]); // an toàn: chưa merge vào nhánh chính
+    const { dir, branch, baseSha } = worktreeToClean;
+    const dirty = git(["-C", dir, "status", "--porcelain"]).out !== "";
+    const moved = git(["-C", dir, "rev-parse", "HEAD"]).out !== baseSha;
+    if (dirty || moved) {
+      console.error(`\n   💾 GIỮ LẠI worktree (có việc dở): ${dir}`);
+      console.error(`      Branch: ${branch}`);
+      console.error(`      Xem: git -C "${dir}" diff HEAD`);
+      console.error(`      Xong việc thì merge/dọn thủ công; muốn bỏ: git worktree remove --force "${dir}"`);
+    } else {
+      git(["worktree", "remove", "--force", dir]);
+      git(["branch", "-D", branch]);
+    }
   }
   process.exit(1);
 }
@@ -255,7 +267,7 @@ if (useWorktree) {
   const add = git(["worktree", "add", "-B", branch, dir, "HEAD"]);
   if (add.code !== 0) await fail(`Không tạo được worktree: ${add.err}. (Dùng --in-place nếu muốn sửa thẳng.)`);
   workDir = dir;
-  worktreeToClean = { dir, branch };
+  worktreeToClean = { dir, branch, baseSha: git(["-C", dir, "rev-parse", "HEAD"]).out };
   status.workspace.dir = dir;
   status.workspace.branch = branch;
   console.log(`  worktree: ${dir}  (branch ${branch})`);
@@ -290,7 +302,15 @@ const c = await run("codex", codexArgs, {
 });
 await writeFile(path.join(taskDir, "codex-result.md"), c.stdout.trim() || c.stderr.trim());
 status.completed.push("implementation");
-if (!c.ok) await fail(`Codex thất bại (code ${c.code}). Xem ${path.join(taskDir, "codex.log")}`);
+if (!c.ok) {
+  // nhận diện hết-limit/nghẽn để báo là "thử lại sau", không phải bug
+  const rate = /rate.?limit|quota|usage limit|too many requests|429|insufficient.*credit|overloaded/i
+    .test(c.stdout + c.stderr);
+  status.error_kind = rate ? "rate_limit" : (c.code === 124 ? "timeout" : "error");
+  await fail(rate
+    ? `Codex hết limit/nghẽn (đã lưu việc dở). Chờ limit reset rồi chạy lại: node tools/ai-team.mjs --task-id ${taskId} --in-place "<task>". Log: ${path.join(taskDir, "codex.log")}`
+    : `Codex thất bại (code ${c.code}). Xem ${path.join(taskDir, "codex.log")}`);
+}
 
 // --- báo cáo ------------------------------------------------------------
 status.state = "done";
