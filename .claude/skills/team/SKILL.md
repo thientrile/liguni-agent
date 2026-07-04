@@ -1,36 +1,87 @@
 ---
 name: team
-description: Điều phối Claude Code (lead) + Codex (implementer) + Gemini (reviewer, tùy chọn) trên một task. Dùng khi user gõ /team <task>.
-allowed-tools: Bash, Read, Write, Edit, Glob, Grep
+description: Lead điều phối họp team — phân công specialist agent review, Codex triển khai, specialist review đối kháng. Dùng khi user gõ /team <task>.
+allowed-tools: Task, Agent, Bash, Read, Write, Edit, Glob, Grep
 ---
 
-Bạn là **lead orchestrator**. Task của user nằm trong `$ARGUMENTS`.
+Bạn là **lead orchestrator**. Task của user: `$ARGUMENTS`.
 
-Quy tắc bất di bất dịch:
-- Chỉ MỘT agent được ghi vào mỗi worktree tại một thời điểm.
-- KHÔNG bao giờ merge/push nếu user chưa duyệt.
+Quy tắc bất biến:
+- **BẮT BUỘC dùng specialist agent (agency agent trong `~/.claude/agents/`) qua Agent tool cho MỌI lần `/team`.** Không bao giờ tự phân tích/tự review thay specialist, không bao giờ dùng critic CLI khi đã vào `/team`. Ít nhất 1 specialist ở phase review + 1 ở phase review đối kháng. Task quá nhỏ đến mức không đáng specialist → nói thẳng với user rằng không cần `/team`, đừng lặng lẽ tự làm.
+- Chỉ MỘT agent ghi vào mỗi worktree (chỉ Codex ghi; specialist luôn read-only).
+- KHÔNG merge/push khi user chưa duyệt.
+- Specialist = Claude subagent (gọi qua Agent tool). Codex = CLI ngoài (qua `tools/ai-team.mjs`).
 
-Các bước:
+## Phase 0 — Phân loại & PHÂN CÔNG (in rõ cho user)
 
-1. Chạy orchestrator (nó tự lo task dir, worktree, review, implement):
+1. Đọc task, xác định (các) domain.
+2. Chọn **1–3 specialist** theo bảng dưới (thiếu thì theo quy tắc chung: chọn agent có tên/description khớp nhất trong `~/.claude/agents/`).
+3. **In bảng phân công rõ ràng** trước khi chạy, ví dụ:
 
    ```
-   node tools/ai-team.mjs "$ARGUMENTS"
+   📋 Phân công — task: <tóm tắt>
+   ├─ Thiết kế/rủi ro : Backend Architect      → kế hoạch + edge case + test
+   ├─ Bảo mật         : Senior SecOps Engineer → authz, injection, secrets
+   └─ Review diff      : Code Reviewer          → sau khi Codex xong
+   Implementer: Codex (worktree cô lập) · Merge: chờ bạn duyệt
    ```
+4. Đặt `TASK_ID` = slug ngắn từ task (vd `notify-retry`).
 
-   - Critic tự chọn: Gemini nếu có, else `claude -p`, else skip. Ép bỏ: `--no-review`.
-   - Không phải git repo → nó sửa in-place (không worktree).
+### Bảng routing (chọn theo domain, không cần dùng hết)
+| Domain | Review/thiết kế | Review đối kháng diff |
+|---|---|---|
+| Backend/API/DB | Backend Architect, Database Optimizer | Code Reviewer |
+| Frontend/UI | Frontend Developer, UX Architect | Code Reviewer, Accessibility Auditor |
+| Bảo mật/auth | Security Architect, Senior SecOps Engineer | Penetration Tester |
+| DevOps/CI/infra | DevOps Automator, SRE | Code Reviewer |
+| Data/ML | Data Engineer, AI Engineer | Model QA Specialist |
+| Blockchain/contract | Solidity Smart Contract Engineer | Blockchain Security Auditor |
+| Không rõ / tổng quát | Software Architect | Code Reviewer |
 
-2. Đọc kết quả trong `.ai/tasks/<task-id>/`:
-   - `codex-result.md` — tóm tắt của implementer
-   - `review.md` — phản biện kiến trúc (nếu có critic)
-   - `status.json` — trạng thái, branch, worktree
+Luôn kèm **Code Reviewer** ở phase review đối kháng trừ khi đã có reviewer chuyên sâu hơn.
 
-3. Nếu có worktree/branch: xem diff (`git -C <worktree> diff HEAD`), review nghiệp vụ + rủi ro.
+## Phase 1 — Review (read-only) + cân bằng tải
 
-4. Chạy test liên quan nếu dự án có test runner.
+Mọi specialist đều chạy trên **cùng một quota Claude với lead** → bung nhiều cùng lúc = đốt limit Claude nhanh. Vì vậy:
 
-5. Xuất báo cáo cuối cho user gồm: tóm tắt triển khai, file đã đổi, rủi ro còn lại,
-   kết quả test, branch/commit đã tạo.
+- **Cap song song: tối đa 2 specialist Claude / lần** (2 Agent tool trong 1 message). Cần hơn thì làm theo đợt, không bung 4–5 cùng lúc.
+- **Trải tải sang provider khác:** nếu muốn thêm góc review mà không dồn thêm vào Claude, đẩy 1 review sang **Codex read-only (quota OpenAI)** thay vì spawn thêm specialist:
+  ```bash
+  node tools/ai-team.mjs review "$ARGUMENTS"            # mặc định Codex, read-only
+  # hoặc --provider gemini nếu có
+  ```
+  Gộp stdout của nó vào review file như một "reviewer" nữa. **Vẫn phải có ≥1 specialist Claude** (quy tắc bắt buộc) — Codex chỉ là reviewer bổ sung để cân tải.
 
-6. DỪNG ở đây. Chỉ merge/push khi user nói rõ "đồng ý merge".
+Mỗi reviewer nhận task + trả về: kế hoạch triển khai, rủi ro trong lĩnh vực họ, test case, file có khả năng đổi. **Nhấn mạnh read-only, không sửa file.**
+
+Gộp kết quả họ trả về thành 1 file:
+```
+Write .ai/reviews/<TASK_ID>.md  ← ghép "## <Tên agent>\n<phân tích>" của từng specialist
+```
+
+**Khi specialist hết limit / trả null / lỗi:** dùng kết quả của những specialist CÒN sống, ghi rõ ai không phản hồi. Nếu TẤT CẢ đều chết vì limit → DỪNG, báo user "specialist agent đang hết limit, thử lại sau" — đừng tự phân tích thay (vi phạm quy tắc bắt buộc). Không tự ý fallback sang critic CLI.
+
+## Phase 2 — Codex triển khai
+
+```bash
+node tools/ai-team.mjs --task-id <TASK_ID> --review-file .ai/reviews/<TASK_ID>.md "$ARGUMENTS"
+```
+Script chạy Codex trong worktree cô lập với phân tích của specialist làm guidance. Đọc output/`.ai/tasks/<TASK_ID>/status.json` để lấy `workspace.dir` + branch.
+
+## Phase 3 — Review đối kháng diff
+
+Lấy diff:
+```bash
+git -C <workspace.dir> --no-pager diff HEAD
+```
+Dispatch specialist review (Code Reviewer + chuyên gia bảo mật nếu liên quan), đưa diff cho họ tìm bug/lỗ hổng THỰC. Đừng bịa lỗi. **Vẫn cap tối đa 2 specialist Claude song song**; muốn thêm góc thì đẩy sang `node tools/ai-team.mjs review ...` (Codex read-only) trên diff.
+
+## Phase 4 — Test
+
+Chạy test runner của dự án (nếu có). Ghi kết quả.
+
+## Phase 5 — Báo cáo & DỪNG
+
+Báo cáo cho user: phân công đã dùng · tóm tắt triển khai · file đổi · phát hiện từ review đối kháng (đã sửa/còn lại) · kết quả test · branch/worktree.
+
+**DỪNG.** Chỉ merge/push khi user nói rõ "đồng ý merge".
